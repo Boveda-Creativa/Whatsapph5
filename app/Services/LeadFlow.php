@@ -11,14 +11,25 @@ use App\Services\AiResponder;
 class LeadFlow
 {
     public function __construct(
-    private WhatsAppCloud $wa,
-    private FaqMatcher $faq,
-    private AiResponder $ai
-) {}
+        private WhatsAppCloud $wa,
+        private FaqMatcher $faq,
+        private AiResponder $ai
+    ) {}
 
     public function handle(WaConversation $c, string $text): void
     {
-        if ($c->mode === 'human') return;
+        // Si ya está en handoff/humano, sigue atendiendo como bot de soporte
+        if ($c->mode === 'human' || $c->state === 'handoff') {
+            $this->handlePostHandoff($c, $text);
+            return;
+        }
+
+        // 1) Handoff inmediato si lo pide
+        if ($this->wantsHuman($text)) {
+            $this->handoff($c, "El prospecto pidió hablar con alguien.");
+            return;
+        }
+
 
         // 1) Handoff inmediato si lo pide
         if ($this->wantsHuman($text)) {
@@ -34,13 +45,25 @@ class LeadFlow
             return;
         }
 
-        $aiReply = $this->ai->respond($text);
+        $history = WaMessage::where('conversation_id', $c->id)
+            ->orderBy('id')
+            ->take(10)
+            ->get()
+            ->map(fn(WaMessage $m) => [
+                'role'    => $m->direction === 'in' ? 'user' : 'assistant',
+                'content' => $m->body,
+            ])
+            ->toArray();
 
+        $aiReply = $this->ai->respond($text, $history);
         if ($aiReply) {
             $this->reply($c, $aiReply);
+            // Si es la primera vez que habla, pasamos a pedir nombre
+            if ($c->state === 'new') {
+                $c->update(['state' => 'ask_name']);
+            }
             return;
         }
-
         // 3) Flujo por estados
         match ($c->state) {
             'new' => $this->askName($c),
@@ -57,6 +80,28 @@ class LeadFlow
         };
     }
 
+    private function handlePostHandoff(WaConversation $c, string $text): void
+    {
+        $faqAnswer = $this->faq->match($text);
+
+        if ($faqAnswer) {
+            $this->reply(
+                $c,
+                $faqAnswer . "\n\nTu conversación ya fue compartida con un asesor y te dará seguimiento en breve."
+            );
+            return;
+        }
+
+        $this->reply(
+            $c,
+            "Gracias por tu mensaje 🙌 Ya compartimos tu información con un asesor para darte seguimiento.\n\n"
+            . "En lo que te contacta, también puedo ayudarte con dudas rápidas sobre capacidad, ubicación, paquetes, apartado o servicios."
+        );
+
+        // Aquí puedes además notificar al humano que el prospecto volvió a escribir
+        // $this->notifyHumanFollowUp($c, $text);
+    }
+
     private function askName(WaConversation $c): void
     {
         $c->update(['state' => 'ask_name']);
@@ -71,6 +116,8 @@ class LeadFlow
         $c->update(['lead_id' => $lead->id]);
         return $lead;
     }
+
+
 
     private function saveNameAskEventType(WaConversation $c, string $text): void
     {
@@ -125,7 +172,29 @@ class LeadFlow
 
         $this->reply($c, "Perfecto 🙌 Ya tengo la información. Te conecto con un asesor para darte seguimiento.");
 
-        // TODO: notificar al humano (Telegram/Email/CRM) con resumen
+        $summary = $this->buildLeadSummary($lead, $reason);
+
+        $internalNumber = config('services.whatsapp.internal_notify_number');
+
+        if ($internalNumber) {
+            $this->wa->sendText($internalNumber, $summary);
+        }
+    }
+
+    private function buildLeadSummary(WaLead $lead, string $reason): string
+    {
+        return "Nuevo lead calificado 🚨\n\n"
+            . "Motivo: {$reason}\n"
+            . "Nombre: " . ($lead->name ?? 'N/D') . "\n"
+            . "Teléfono: " . ($lead->phone ?? 'N/D') . "\n"
+            . "Evento: " . ($lead->event_type ?? 'N/D') . "\n"
+            . "Fecha: " . ($lead->event_date ?? 'N/D') . "\n"
+            . "Personas: " . ($lead->people_count ?? 'N/D') . "\n"
+            . "Presupuesto: " . ($lead->budget_range ?? 'N/D') . "\n"
+            . "Paquete: " . ($lead->package_type ?? 'N/D') . "\n"
+            . "Tipo cliente: " . ($lead->customer_type ?? 'N/D') . "\n"
+            . "Origen: " . ($lead->source ?? 'N/D') . "\n"
+            . "Score: " . ($lead->score ?? 0);
     }
 
     private function normalizeEventType(string $text): string

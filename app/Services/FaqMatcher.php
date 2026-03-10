@@ -40,6 +40,39 @@ class FaqMatcher
         if (str_contains($t, 'planner') || str_contains($t, 'coordin')) {
             return "No manejamos coordinación de eventos; eso se ve con su planner.";
         }
+        if (str_contains($t, 'mobiliario') || str_contains($t, 'mueble') || str_contains($t, 'mesa')) {
+            return "Sí, la renta incluye mobiliario (a partir de 60 personas).";
+        }
+        if (str_contains($t, 'mínimo') || str_contains($t, 'minimo')) {
+            return "El mínimo sugerido para eventos en nuestro local es de 50 personas.";
+        }
+        if (str_contains($t, 'banquete')) {
+            return "Manejamos un menú para bodas y otros tipos de eventos (desde taquizas hasta paella mixta).";
+        }
+        if (str_contains($t, 'generador') || str_contains($t, 'planta')) {
+            return "Sí, contamos con generador eléctrico en la mayoría de los paquetes de 100 personas en adelante.";
+        }
+        if (str_contains($t, 'mascota')) {
+            return "Dependiendo del caso se permiten mascotas; nos reservamos el derecho.";
+        }
+        if (str_contains($t, 'caballo')) {
+            return "No permitimos caballos en el local.";
+        }
+        if (str_contains($t, 'cocina')) {
+            return "Sí, contamos con una cocina equipada con equipos de gas y refrigeración.";
+        }
+        if ((str_contains($t, 'llevar') && str_contains($t, 'banquete')) || str_contains($t, 'chef')) {
+            return "En algunos casos podemos descontar el banquete y usted puede llevar su propio chef y utilizar nuestra cocina.";
+        }
+        if ((str_contains($t, 'qué incluye') || str_contains($t, 'incluye')) && str_contains($t, 'local')) {
+            return "La renta del local incluye nuestro personal de staff y supervisor.";
+        }
+        if (str_contains($t, 'hora extra')) {
+            return "La hora extra incluye la renta del local y nuestro personal de staff; no incluye meseros ni cantineros.";
+        }
+        if (str_contains($t, 'pago') && (str_contains($t, 'plazo') || str_contains($t, 'pagos'))) {
+            return "Manejamos un sistema de pagos cómodos; el evento debe quedar liquidado 30 días antes.";
+        }
 
         return null;
     }
