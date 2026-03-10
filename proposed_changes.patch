@@ -1,0 +1,171 @@
+*** Begin Patch
+*** Update File: app/Http/Controllers/WhatsAppWebhookController.php
+@@ public function receive(Request $request)
+-    dispatch(new \App\Jobs\ProcessIncomingWaMessage($conversation->id, $text));
++    // Dispatch the incoming message synchronously so responses are sent immediately.
++    // Using dispatchSync avoids the need for a running queue worker.
++    \App\Jobs\ProcessIncomingWaMessage::dispatchSync($conversation->id, $text);
+
+*** End Patch
+*** Update File: app/Services/FaqMatcher.php
+@@ public function match(string $text): ?string
+         if (str_contains($t, 'tarjeta')) {
+             return "De momento no aceptamos tarjeta; únicamente efectivo o transferencia interbancaria.";
+         }
++        // Mobiliario incluido en paquetes
++        if (str_contains($t, 'mobiliario') || str_contains($t, 'mueble') || str_contains($t, 'mesas') || str_contains($t, 'sillas')) {
++            return "Sí, la mayoría de nuestros paquetes incluyen mobiliario a partir de 60 personas.";
++        }
++        // Mínimo sugerido de personas
++        if (str_contains($t, 'mínimo') || str_contains($t, 'minimo') || (str_contains($t, 'mín') && str_contains($t, 'person'))) {
++            return "El mínimo sugerido para eventos en nuestro local es de 50 personas en adelante.";
++        }
++        // Tipo de banquete o menú
++        if (str_contains($t, 'banquete') || str_contains($t, 'menú') || str_contains($t, 'menu') || str_contains($t, 'cena')) {
++            return "Manejamos un menú para bodas y otros tipos de eventos; desde taquizas hasta paella mixta.";
++        }
++        // Generador eléctrico
++        if ((str_contains($t, 'generador') && str_contains($t, 'eléctrico')) || str_contains($t, 'luz') || str_contains($t, 'planta')) {
++            return "Sí, contamos con generador eléctrico en la mayoría de los paquetes a partir de 100 personas.";
++        }
++        // Políticas sobre mascotas
++        if (str_contains($t, 'mascota') || str_contains($t, 'perro') || str_contains($t, 'gato')) {
++            return "Dependiendo del caso permitimos el acceso de mascotas; nos reservamos el derecho de admisión.";
++        }
++        // Animales como caballos
++        if (str_contains($t, 'caballo') || str_contains($t, 'caballos')) {
++            return "No se permite la entrada de caballos a nuestras instalaciones.";
++        }
++        // Habitaciones o alojamiento
++        if (str_contains($t, 'habitación') || str_contains($t, 'habitaciones') || str_contains($t, 'alojamiento') || str_contains($t, 'hotel')) {
++            return "No contamos con habitaciones; únicamente tenemos una villa (master suite) exclusiva para los novios en bodas.";
++        }
++        // Cocina disponible
++        if (str_contains($t, 'cocina') || str_contains($t, 'chef') || str_contains($t, 'cocinar')) {
++            return "Contamos con una cocina equipada con equipos de gas y refrigeración.";
++        }
++        // Llevar banquete propio o chef
++        if (str_contains($t, 'llevar') && str_contains($t, 'banquete')) {
++            return "En algunos casos se puede descontar el banquete y traer su propio banquete; incluso puede utilizar nuestra cocina.";
++        }
++        if (str_contains($t, 'llevar') && str_contains($t, 'chef')) {
++            return "Sí, en algunos paquetes puede traer su chef y nosotros descontamos el banquete; puede utilizar nuestra cocina.";
++        }
++        // Qué incluye la renta del local
++        if (str_contains($t, 'qué incluye') || str_contains($t, 'que incluye') || (str_contains($t, 'incluye') && str_contains($t, 'local'))) {
++            return "La renta del local incluye nuestro personal de staff y supervisor.";
++        }
++        // Hora extra de renta
++        if (str_contains($t, 'hora extra') || (str_contains($t, 'extra') && str_contains($t, 'hora'))) {
++            return "La hora extra incluye la renta del local y nuestro personal de staff; no incluye servicio de meseros ni cantineros.";
++        }
++        // Sistema de pagos o plazos
++        if (str_contains($t, 'pagos') || str_contains($t, 'plazos') || str_contains($t, 'comod')) {
++            return "Manejamos un sistema de pagos; su evento debe quedar liquidado 30 días antes de la fecha.";
++        }
+*** End Patch
+*** Add File: app/Services/AiResponder.php
++<?php
++
++namespace App\Services;
++
++use Illuminate\Support\Facades\Http;
++
++/**
++ * AiResponder permite generar respuestas más humanas a través del modelo de lenguaje de OpenAI.
++ * Este servicio se basa en la API de OpenAI (ChatGPT) y requiere configurar la variable
++ * OPENAI_API_KEY en el archivo .env.
++ */
++class AiResponder
++{
++    protected string $apiKey;
++
++    public function __construct()
++    {
++        $this->apiKey = config('services.openai.api_key');
++    }
++
++    /**
++     * Envía el mensaje del usuario al modelo de lenguaje y devuelve una respuesta.
++     * Para mantener el control del flujo, se puede ajustar el prompt para que el modelo
++     * responda de forma cordial y luego solicite la información necesaria.
++     */
++    public function respond(string $userMessage): ?string
++    {
++        if (!$this->apiKey) {
++            // Si no hay API key configurada, no se intenta llamar al modelo.
++            return null;
++        }
++
++        $endpoint = 'https://api.openai.com/v1/chat/completions';
++        $payload = [
++            'model' => 'gpt-3.5-turbo',
++            'messages' => [
++                [
++                    'role' => 'system',
++                    'content' => 'Eres un amable asistente de un salón de eventos que ayuda a resolver dudas y recopilar datos de clientes. Responde de manera breve, cordial y profesional.',
++                ],
++                [
++                    'role' => 'user',
++                    'content' => $userMessage,
++                ],
++            ],
++            'max_tokens' => 200,
++            'temperature' => 0.6,
++        ];
++
++        try {
++            $response = Http::withToken($this->apiKey)
++                ->timeout(10)
++                ->post($endpoint, $payload)
++                ->throw()
++                ->json();
++
++            return data_get($response, 'choices.0.message.content');
++        } catch (\Throwable $e) {
++            // Log de error y fallback a null para no interrumpir el flujo principal.
++            \Log::error('AI response error: ' . $e->getMessage());
++            return null;
++        }
++    }
++}
++
+*** End Patch
+*** Update File: app/Services/LeadFlow.php
+@@
+-    public function __construct(
+-        private WhatsAppCloud $wa,
+-        private FaqMatcher $faq
+-    ) {}
++    public function __construct(
++        private WhatsAppCloud $wa,
++        private FaqMatcher $faq,
++        private ?AiResponder $ai = null
++    ) {}
+@@ public function handle(WaConversation $c, string $text): void
+-        // 2) FAQs
+-        $faqAnswer = $this->faq->match($text);
+-        if ($faqAnswer) {
+-            $this->reply($c, $faqAnswer . "\n\nPara cotizar, ¿me compartes tu nombre completo?");
+-            if ($c->state === 'new') $c->update(['state' => 'ask_name']);
+-            return;
+-        }
++        // 2) FAQs
++        $faqAnswer = $this->faq->match($text);
++        if ($faqAnswer) {
++            $this->reply($c, $faqAnswer . "\n\nPara cotizar, ¿me compartes tu nombre completo?");
++            if ($c->state === 'new') $c->update(['state' => 'ask_name']);
++            return;
++        }
++
++        // 2.5) AI fallback para preguntas abiertas o tono más humano
++        if ($this->ai) {
++            $aiReply = $this->ai->respond($text);
++            if ($aiReply) {
++                // Envía la respuesta de la IA y luego continúa con el flujo normal (preguntar nombre).
++                $this->reply($c, $aiReply . "\n\nPara cotizar, ¿me compartes tu nombre completo?");
++                if ($c->state === 'new') $c->update(['state' => 'ask_name']);
++                return;
++            }
++        }
+*** End Patch

@@ -6,13 +6,15 @@ use App\Models\WaConversation;
 use App\Models\WaLead;
 use App\Models\WaMessage;
 use Carbon\Carbon;
+use App\Services\AiResponder;
 
 class LeadFlow
 {
     public function __construct(
-        private WhatsAppCloud $wa,
-        private FaqMatcher $faq
-    ) {}
+    private WhatsAppCloud $wa,
+    private FaqMatcher $faq,
+    private AiResponder $ai
+) {}
 
     public function handle(WaConversation $c, string $text): void
     {
@@ -29,6 +31,13 @@ class LeadFlow
         if ($faqAnswer) {
             $this->reply($c, $faqAnswer . "\n\nPara cotizar, ¿me compartes tu nombre completo?");
             if ($c->state === 'new') $c->update(['state' => 'ask_name']);
+            return;
+        }
+
+        $aiReply = $this->ai->respond($text);
+
+        if ($aiReply) {
+            $this->reply($c, $aiReply);
             return;
         }
 

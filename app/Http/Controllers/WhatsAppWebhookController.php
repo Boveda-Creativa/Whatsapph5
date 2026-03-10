@@ -61,7 +61,7 @@ class WhatsAppWebhookController extends Controller
         'wa_message_id' => data_get($message, 'id'),
     ]);
 
-    dispatch(new \App\Jobs\ProcessIncomingWaMessage($conversation->id, $text));
+    \App\Jobs\ProcessIncomingWaMessage::dispatchSync($conversation->id, $text);
 
     return response('OK',200);
 }
