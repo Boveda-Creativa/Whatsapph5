@@ -15,12 +15,10 @@ class AiResponder
             return null;
         }
 
+        
         $messages = array_merge(
             [
-                [
-                    'role' => 'system',
-                    'content' => 'Eres asistente de un salón de eventos. Responde de forma amable, clara, breve y natural. Ayuda a resolver dudas y a recopilar datos del prospecto sin sonar robótico.'
-                ]
+                ['role' => 'system', 'content' => 'Eres asistente de un salón de eventos. Responde cordialmente y no repitas preguntas si ya tienes los datos.'],
             ],
             $history,
             [
