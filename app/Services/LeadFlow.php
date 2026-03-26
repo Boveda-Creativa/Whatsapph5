@@ -8,6 +8,16 @@ use App\Models\WaMessage;
 use Carbon\Carbon;
 use App\Services\AiResponder;
 
+/**
+ * Este servicio controla el flujo conversacional para calificar leads vía WhatsApp.
+ *
+ * La lógica se ha reordenado para priorizar la captura de datos (tipo de evento,
+ * nombre, fecha, personas, presupuesto, paquete, fecha alternativa, tipo de
+ * cliente y fuente) antes de responder con IA o FAQs. La IA se usa únicamente
+ * en el estado inicial (new) y cuando el usuario realiza preguntas fuera del
+ * flujo de calificación. Después de cualquier respuesta (de IA o FAQ), el bot
+ * guía al usuario a la siguiente pregunta de calificación.
+ */
 class LeadFlow
 {
     public function __construct(
@@ -24,16 +34,91 @@ class LeadFlow
             return;
         }
 
-        // 1) Handoff inmediato si lo pide
+        // Si el usuario solicita hablar con un asesor, pasamos a handoff inmediatamente
         if ($this->wantsHuman($text)) {
             $this->handoff($c, "El prospecto pidió hablar con alguien.");
             return;
         }
 
-        // 2) FAQs
+        /*
+         * Procesar el flujo de preguntas obligatorias ANTES de intentar FAQs o IA.
+         * Esto asegura que los mensajes que responden a preguntas de calificación
+         * no sean interpretados como dudas generales. Solo si no estamos en
+         * ningún estado de calificación pasaremos a FAQs o IA.
+         */
+        switch ($c->state) {
+            case 'ask_event_type':
+                $this->saveEventTypeAskName($c, $text);
+                return;
+            case 'ask_name':
+                $this->saveNameAskDate($c, $text);
+                return;
+            case 'ask_event_date':
+                $this->saveDateAskPeople($c, $text);
+                return;
+            case 'ask_people_count':
+                $this->savePeopleAskBudget($c, $text);
+                return;
+            case 'ask_budget_range':
+                $this->saveBudgetAskPackage($c, $text);
+                return;
+            case 'ask_package_type':
+                $this->savePackageAskAltDate($c, $text);
+                return;
+            case 'ask_alt_date':
+                $this->saveAltDateAskCustomerType($c, $text);
+                return;
+            case 'ask_customer_type':
+                $this->saveCustomerTypeAskSource($c, $text);
+                return;
+            case 'ask_source':
+                $this->saveSourceAndHandoff($c, $text);
+                return;
+        }
+
+        /*
+         * Estado inicial ('new'): permitimos respuestas amistosas con FAQs o IA
+         * antes de iniciar la calificación. Al terminar, iniciamos la primera
+         * pregunta (tipo de evento).
+         */
+        if ($c->state === 'new') {
+            // Intentar match FAQ
+            $faqAnswer = $this->faq->match($text);
+            if ($faqAnswer) {
+                $this->reply($c, $faqAnswer);
+                $this->askEventType($c);
+                return;
+            }
+
+            // Intentar respuesta de IA con historial
+            $history = WaMessage::where('conversation_id', $c->id)
+                ->orderBy('id')
+                ->take(10)
+                ->get()
+                ->map(fn(WaMessage $m) => [
+                    'role'    => $m->direction === 'in' ? 'user' : 'assistant',
+                    'content' => $m->body,
+                ])
+                ->toArray();
+            $aiReply = $this->ai->respond($text, $history);
+            if ($aiReply) {
+                $this->reply($c, $aiReply);
+                $this->askEventType($c);
+                return;
+            }
+
+            // Si no hay FAQ ni IA, iniciamos el flujo de calificación
+            $this->askEventType($c);
+            return;
+        }
+
+        /*
+         * Fuera de estados de calificación: permitimos FAQs e IA. Esto cubre
+         * situaciones en las que el usuario escribe fuera del flujo formal,
+         * ya sea para dudas generales o después de haber completado el perfil.
+         */
         $faqAnswer = $this->faq->match($text);
         if ($faqAnswer) {
-            // Envía respuesta de FAQ y dirige a continuar con perfil
             $this->reply($c, $faqAnswer);
             $this->askNextQuestion($c);
             return;
@@ -48,36 +133,20 @@ class LeadFlow
                 'content' => $m->body,
             ])
             ->toArray();
-
         $aiReply = $this->ai->respond($text, $history);
         if ($aiReply) {
-            // Envía la respuesta de la IA
             $this->reply($c, $aiReply);
-            // Después dirige al usuario a completar su perfil con la siguiente pregunta
             $this->askNextQuestion($c);
             return;
         }
-        // 3) Flujo por estados
-        match ($c->state) {
-            // flujo inicial: primero preguntamos el tipo de evento, luego nombre, luego fecha
-            'new' => $this->askEventType($c),
-            'ask_event_type' => $this->saveEventTypeAskName($c, $text),
-            'ask_name' => $this->saveNameAskDate($c, $text),
-            'ask_event_date' => $this->saveDateAskPeople($c, $text),
-            'ask_people_count' => $this->savePeopleAskBudget($c, $text),
-            'ask_budget_range' => $this->saveBudgetAskPackage($c, $text),
-            'ask_package_type' => $this->savePackageAskAltDate($c, $text),
-            'ask_alt_date' => $this->saveAltDateAskCustomerType($c, $text),
-            'ask_customer_type' => $this->saveCustomerTypeAskSource($c, $text),
-            'ask_source' => $this->saveSourceAndHandoff($c, $text),
-            default => $this->askEventType($c),
-        };
+
+        // Si no hay nada que responder, guía al siguiente paso
+        $this->askNextQuestion($c);
     }
 
     private function handlePostHandoff(WaConversation $c, string $text): void
     {
         $faqAnswer = $this->faq->match($text);
-
         if ($faqAnswer) {
             $this->reply(
                 $c,
@@ -91,9 +160,6 @@ class LeadFlow
             "Gracias por tu mensaje 🙌 Ya compartimos tu información con un asesor para darte seguimiento.\n\n"
             . "En lo que te contacta, también puedo ayudarte con dudas rápidas sobre capacidad, ubicación, paquetes, apartado o servicios."
         );
-
-        // Aquí puedes además notificar al humano que el prospecto volvió a escribir
-        // $this->notifyHumanFollowUp($c, $text);
     }
 
     private function askName(WaConversation $c): void
@@ -159,14 +225,12 @@ class LeadFlow
 
     /**
      * Envía la próxima pregunta según el estado actual para guiar al usuario
-     * a completar su perfil después de una respuesta de IA.
+     * a completar su perfil después de una respuesta de IA o FAQ.
      */
     private function askNextQuestion(WaConversation $c): void
     {
         switch ($c->state) {
             case 'new':
-                $this->askEventType($c);
-                break;
             case 'ask_event_type':
                 $this->askEventType($c);
                 break;
@@ -209,7 +273,7 @@ class LeadFlow
                 $this->reply($c, "¿Cómo te enteraste de nosotros? (Facebook, Instagram, recomendación, Google, etc.)");
                 break;
             default:
-                // en handoff o estados no contemplados, no hacemos nada
+                // en estados no contemplados, no hacemos nada
                 break;
         }
     }
@@ -217,7 +281,6 @@ class LeadFlow
     private function reply(WaConversation $c, string $text): void
     {
         $this->wa->sendText($c->phone, $text);
-
         WaMessage::create([
             'conversation_id' => $c->id,
             'direction' => 'out',
@@ -247,7 +310,6 @@ class LeadFlow
         $summary = $this->buildLeadSummary($lead, $reason);
 
         $internalNumber = config('services.whatsapp.internal_notify_number');
-
         if ($internalNumber) {
             $this->wa->sendText($internalNumber, $summary);
         }
@@ -285,15 +347,12 @@ class LeadFlow
     private function saveDateAskPeople(WaConversation $c, string $text): void
     {
         $lead = $this->ensureLead($c);
-
         $date = $this->parseDateMx($text);
         if (!$date) {
             $this->reply($c, "Para confirmar, ¿me compartes la fecha en formato día/mes/año? (Ej: 15/05/2026)");
             return;
         }
-
         $lead->update(['event_date' => $date->toDateString()]);
-
         $c->update(['state' => 'ask_people_count']);
         $this->reply($c, "Gracias. ¿Para cuántas personas sería aproximadamente tu evento?");
     }
@@ -301,17 +360,14 @@ class LeadFlow
     private function savePeopleAskBudget(WaConversation $c, string $text): void
     {
         $lead = $this->ensureLead($c);
-
         $people = $this->parsePeopleCount($text);
         if (!$people) {
             $this->reply($c, "¿Me ayudas con un número aproximado de personas? (Ej: 80)");
             return;
         }
-
-        // Filtro útil: si es menor a 50, ya empiezas a orientar (sin cortar en seco)
+        // Filtro útil: si es menor a 50, se orienta sin cortar en seco
         if ($people < 50) {
             $lead->update(['people_count' => $people]);
-
             $c->update(['state' => 'ask_budget_range']);
             $this->reply(
                 $c,
@@ -321,9 +377,7 @@ class LeadFlow
             );
             return;
         }
-
         $lead->update(['people_count' => $people]);
-
         $c->update(['state' => 'ask_budget_range']);
         $this->reply(
             $c,
@@ -335,7 +389,6 @@ class LeadFlow
     private function saveBudgetAskPackage(WaConversation $c, string $text): void
     {
         $lead = $this->ensureLead($c);
-
         $budget = $this->normalizeBudgetRange($text);
         if (!$budget) {
             $this->reply(
@@ -345,9 +398,7 @@ class LeadFlow
             );
             return;
         }
-
         $lead->update(['budget_range' => $budget]);
-
         $c->update(['state' => 'ask_package_type']);
         $this->reply(
             $c,
@@ -361,7 +412,6 @@ class LeadFlow
     private function savePackageAskAltDate(WaConversation $c, string $text): void
     {
         $lead = $this->ensureLead($c);
-
         $package = $this->normalizePackageType($text);
         if (!$package) {
             $this->reply(
@@ -373,9 +423,7 @@ class LeadFlow
             );
             return;
         }
-
         $lead->update(['package_type' => $package]);
-
         $c->update(['state' => 'ask_alt_date']);
         $this->reply($c, "¿Tienes alguna fecha alternativa en caso de que la principal no esté disponible? (Sí/No)");
     }
@@ -383,9 +431,7 @@ class LeadFlow
     private function saveAltDateAskCustomerType(WaConversation $c, string $text): void
     {
         $lead = $this->ensureLead($c);
-
         $yn = $this->parseYesNo($text);
-
         if ($yn === null) {
             // Puede que el usuario ya te haya dado una fecha directa
             $date = $this->parseDateMx($text);
@@ -395,18 +441,15 @@ class LeadFlow
                 $this->reply($c, "Perfecto. ¿El evento sería para empresa o persona física?");
                 return;
             }
-
             $this->reply($c, "¿Tienes una fecha alternativa? Responde Sí o No (o envíame la fecha alternativa día/mes/año).");
             return;
         }
-
         if ($yn === false) {
             $lead->update(['alt_date' => null]);
             $c->update(['state' => 'ask_customer_type']);
             $this->reply($c, "Perfecto. ¿El evento sería para empresa o persona física?");
             return;
         }
-
         // Sí: pide la fecha
         $this->reply($c, "Buenísimo. ¿Cuál sería tu fecha alternativa? (día/mes/año)");
         // Mantén el estado en ask_alt_date para que el próximo mensaje capture la fecha
@@ -415,15 +458,12 @@ class LeadFlow
     private function saveCustomerTypeAskSource(WaConversation $c, string $text): void
     {
         $lead = $this->ensureLead($c);
-
         $type = $this->normalizeCustomerType($text);
         if (!$type) {
             $this->reply($c, "¿Sería para:\n1) Empresa\n2) Persona física?");
             return;
         }
-
         $lead->update(['customer_type' => $type]);
-
         $c->update(['state' => 'ask_source']);
         $this->reply($c, "¿Cómo te enteraste de nosotros? (Facebook, Instagram, recomendación, Google, etc.)");
     }
@@ -431,33 +471,28 @@ class LeadFlow
     private function saveSourceAndHandoff(WaConversation $c, string $text): void
     {
         $lead = $this->ensureLead($c);
-
         $source = trim($text);
         if (mb_strlen($source) < 2) {
             $this->reply($c, "¿Me lo repites por favor? ¿Cómo te enteraste de nosotros?");
             return;
         }
-
         $lead->update([
             'source' => $source,
             'status' => 'qualified',
             'score' => $this->scoreLead($lead),
         ]);
-
         $this->handoff($c, "Lead calificado automáticamente. Score: {$lead->score}");
     }
 
     private function parseDateMx(string $text): ?Carbon
     {
         $t = trim($text);
-
         // 15/05/2026 o 15-05-2026
         if (preg_match('/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/', $t, $m)) {
             $d = (int)$m[1];
             $mo = (int)$m[2];
             $y = (int)$m[3];
             if ($y < 100) $y += 2000;
-
             try {
                 $dt = Carbon::createFromDate($y, $mo, $d);
                 return $dt->isValid() ? $dt : null;
@@ -465,7 +500,6 @@ class LeadFlow
                 return null;
             }
         }
-
         // “15 de mayo 2026” (simple, sin NLP fancy)
         $months = [
             'enero' => 1,
@@ -494,7 +528,6 @@ class LeadFlow
                 }
             }
         }
-
         return null;
     }
 
@@ -511,7 +544,6 @@ class LeadFlow
     private function normalizeBudgetRange(string $text): ?string
     {
         $t = mb_strtolower($text);
-
         // Acepta: "1", "30-50", "30 a 50", "50k-100k", "200+", etc.
         if (preg_match('/\b1\b/', $t) || str_contains($t, '30') && (str_contains($t, '50') || str_contains($t, 'cincuenta'))) {
             return '30-50';
@@ -528,14 +560,12 @@ class LeadFlow
         if (preg_match('/\b5\b/', $t) || str_contains($t, '200') && (str_contains($t, '+') || str_contains($t, 'mas') || str_contains($t, 'más'))) {
             return '200+';
         }
-
         return null;
     }
 
     private function normalizePackageType(string $text): ?string
     {
         $t = mb_strtolower($text);
-
         if (preg_match('/\b1\b/', $t) || str_contains($t, 'solo') || str_contains($t, 'renta') || str_contains($t, 'local solamente')) {
             return 'local';
         }
@@ -545,7 +575,6 @@ class LeadFlow
         if (preg_match('/\b3\b/', $t) || (str_contains($t, 'paquete') && str_contains($t, 'sin')) || str_contains($t, 'sin banquete')) {
             return 'paquete_sin_banquete';
         }
-
         return null;
     }
 
@@ -554,17 +583,14 @@ class LeadFlow
         $t = mb_strtolower(trim($text));
         $yes = ['si', 'sí', 'simon', 'claro', 'ok', 'va', 'de acuerdo', 'afirmativo'];
         $no  = ['no', 'nel', 'nop', 'para nada', 'negativo'];
-
         foreach ($yes as $w) if ($t === $w || str_contains($t, $w)) return true;
         foreach ($no as $w)  if ($t === $w || str_contains($t, $w)) return false;
-
         return null;
     }
 
     private function normalizeCustomerType(string $text): ?string
     {
         $t = mb_strtolower($text);
-
         if (preg_match('/\b1\b/', $t) || str_contains($t, 'empresa') || str_contains($t, 'empresarial')) {
             return 'empresa';
         }
@@ -574,25 +600,20 @@ class LeadFlow
         return null;
     }
 
-    private function scoreLead(\App\Models\WaLead $lead): int
+    private function scoreLead(WaLead $lead): int
     {
         $score = 0;
-
         if ($lead->event_date) $score += 15;
         if ($lead->people_count) $score += 15;
         if ($lead->budget_range) $score += 25;
         if ($lead->package_type) $score += 10;
-
         // Más personas, más serio
         if ($lead->people_count >= 100) $score += 10;
         if ($lead->people_count >= 200) $score += 10;
-
         // Presupuesto
         if (in_array($lead->budget_range, ['150-200', '200+'], true)) $score += 10;
-
         // Evento fuerte
         if (in_array($lead->event_type, ['boda', 'xv', 'empresarial'], true)) $score += 10;
-
         return min(100, $score);
     }
 }
