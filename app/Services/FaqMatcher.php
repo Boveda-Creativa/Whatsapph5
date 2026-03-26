@@ -74,6 +74,11 @@ class FaqMatcher
             return "Manejamos un sistema de pagos cómodos; el evento debe quedar liquidado 30 días antes.";
         }
 
+        // Preguntas sobre visitas o disponibilidad de fechas
+        if (str_contains($t, 'visita') || str_contains($t, 'cita') || str_contains($t, 'disponib') || str_contains($t, 'agenda')) {
+            return "Las visitas y agenda de fechas se coordinan directamente con un asesor. Con gusto puedo responder tus dudas generales y recabar la información de tu evento para canalizarte.";
+        }
+
         return null;
     }
 }

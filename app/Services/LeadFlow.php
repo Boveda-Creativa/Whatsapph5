@@ -30,18 +30,12 @@ class LeadFlow
             return;
         }
 
-
-        // 1) Handoff inmediato si lo pide
-        if ($this->wantsHuman($text)) {
-            $this->handoff($c, "El prospecto pidió hablar con alguien.");
-            return;
-        }
-
         // 2) FAQs
         $faqAnswer = $this->faq->match($text);
         if ($faqAnswer) {
-            $this->reply($c, $faqAnswer . "\n\nPara cotizar, ¿me compartes tu nombre completo?");
-            if ($c->state === 'new') $c->update(['state' => 'ask_name']);
+            // Envía respuesta de FAQ y dirige a continuar con perfil
+            $this->reply($c, $faqAnswer);
+            $this->askNextQuestion($c);
             return;
         }
 
@@ -57,18 +51,18 @@ class LeadFlow
 
         $aiReply = $this->ai->respond($text, $history);
         if ($aiReply) {
+            // Envía la respuesta de la IA
             $this->reply($c, $aiReply);
-            // Si es la primera vez que habla, pasamos a pedir nombre
-            if ($c->state === 'new') {
-                $c->update(['state' => 'ask_name']);
-            }
+            // Después dirige al usuario a completar su perfil con la siguiente pregunta
+            $this->askNextQuestion($c);
             return;
         }
         // 3) Flujo por estados
         match ($c->state) {
-            'new' => $this->askName($c),
-            'ask_name' => $this->saveNameAskEventType($c, $text),
-            'ask_event_type' => $this->saveEventTypeAskDate($c, $text),
+            // flujo inicial: primero preguntamos el tipo de evento, luego nombre, luego fecha
+            'new' => $this->askEventType($c),
+            'ask_event_type' => $this->saveEventTypeAskName($c, $text),
+            'ask_name' => $this->saveNameAskDate($c, $text),
             'ask_event_date' => $this->saveDateAskPeople($c, $text),
             'ask_people_count' => $this->savePeopleAskBudget($c, $text),
             'ask_budget_range' => $this->saveBudgetAskPackage($c, $text),
@@ -76,7 +70,7 @@ class LeadFlow
             'ask_alt_date' => $this->saveAltDateAskCustomerType($c, $text),
             'ask_customer_type' => $this->saveCustomerTypeAskSource($c, $text),
             'ask_source' => $this->saveSourceAndHandoff($c, $text),
-            default => $this->askName($c),
+            default => $this->askEventType($c),
         };
     }
 
@@ -105,7 +99,29 @@ class LeadFlow
     private function askName(WaConversation $c): void
     {
         $c->update(['state' => 'ask_name']);
-        $this->reply($c, "Hola 👋 Muchas gracias por comunicarte con Hacienda Cinco.\n\n¿Me compartes tu nombre completo?");
+        $this->reply($c, "¿Me compartes tu nombre completo?");
+    }
+
+    /**
+     * Pregunta al usuario qué tipo de evento desea realizar.
+     * Este es el primer paso del flujo, antes de solicitar el nombre.
+     */
+    private function askEventType(WaConversation $c): void
+    {
+        $c->update(['state' => 'ask_event_type']);
+        $this->reply(
+            $c,
+            "Gracias por comunicarte con Hacienda Cinco 🙌\n\n" .
+                "Cuéntanos, ¿cuál es tu tipo de evento?\n" .
+                "- Boda\n" .
+                "- Postboda\n" .
+                "- XV años\n" .
+                "- Bautizo\n" .
+                "- Shower\n" .
+                "- Evento empresarial\n" .
+                "- Sesión de fotos\n" .
+                "- Otro"
+        );
     }
 
     private function ensureLead(WaConversation $c): WaLead
@@ -117,30 +133,86 @@ class LeadFlow
         return $lead;
     }
 
-
-
-    private function saveNameAskEventType(WaConversation $c, string $text): void
-    {
-        $lead = $this->ensureLead($c);
-        $lead->update(['name' => $text]);
-
-        $c->update(['state' => 'ask_event_type']);
-        $this->reply(
-            $c,
-            "Gracias, {$lead->name} 🙌\n\n¿Qué tipo de evento estás buscando?\n- Boda\n- Postboda\n- XV años\n- Bautizo\n- Shower\n- Evento empresarial\n- Sesión de fotos\n- Otro"
-        );
-    }
-
-    private function saveEventTypeAskDate(WaConversation $c, string $text): void
+    /**
+     * Guarda el tipo de evento y solicita el nombre del prospecto.
+     */
+    private function saveEventTypeAskName(WaConversation $c, string $text): void
     {
         $lead = $this->ensureLead($c);
         $lead->update(['event_type' => $this->normalizeEventType($text)]);
 
-        $c->update(['state' => 'ask_event_date']);
-        $this->reply($c, "Perfecto. ¿Cuál es la fecha del evento? (día/mes/año)");
+        $c->update(['state' => 'ask_name']);
+        $this->reply($c, "Perfecto. ¿Me compartes tu nombre completo?");
     }
 
-    // ... y así con cada estado
+    /**
+     * Guarda el nombre y solicita la fecha del evento.
+     */
+    private function saveNameAskDate(WaConversation $c, string $text): void
+    {
+        $lead = $this->ensureLead($c);
+        $lead->update(['name' => $text]);
+
+        $c->update(['state' => 'ask_event_date']);
+        $this->reply($c, "Gracias, {$lead->name} 🙌\n\n¿Cuál es la fecha del evento? (día/mes/año)");
+    }
+
+    /**
+     * Envía la próxima pregunta según el estado actual para guiar al usuario
+     * a completar su perfil después de una respuesta de IA.
+     */
+    private function askNextQuestion(WaConversation $c): void
+    {
+        switch ($c->state) {
+            case 'new':
+                $this->askEventType($c);
+                break;
+            case 'ask_event_type':
+                $this->askEventType($c);
+                break;
+            case 'ask_name':
+                $this->askName($c);
+                break;
+            case 'ask_event_date':
+                $this->reply($c, "¿Cuál es la fecha del evento? (día/mes/año)");
+                break;
+            case 'ask_people_count':
+                $this->reply($c, "¿Para cuántas personas sería aproximadamente tu evento?");
+                break;
+            case 'ask_budget_range':
+                $this->reply(
+                    $c,
+                    "¿Con qué presupuesto aproximado cuentas?\n" .
+                        "- $30k a $50k\n" .
+                        "- $50k a $100k\n" .
+                        "- $100k a $150k\n" .
+                        "- $150k a $200k\n" .
+                        "- $200k+"
+                );
+                break;
+            case 'ask_package_type':
+                $this->reply(
+                    $c,
+                    "¿Qué estás buscando?\n" .
+                        "1) Solo renta del local\n" .
+                        "2) Paquete con banquete\n" .
+                        "3) Paquete sin banquete"
+                );
+                break;
+            case 'ask_alt_date':
+                $this->reply($c, "¿Tienes alguna fecha alternativa en caso de que la principal no esté disponible? (Sí/No)");
+                break;
+            case 'ask_customer_type':
+                $this->reply($c, "¿El evento sería para empresa o persona física?");
+                break;
+            case 'ask_source':
+                $this->reply($c, "¿Cómo te enteraste de nosotros? (Facebook, Instagram, recomendación, Google, etc.)");
+                break;
+            default:
+                // en handoff o estados no contemplados, no hacemos nada
+                break;
+        }
+    }
 
     private function reply(WaConversation $c, string $text): void
     {
@@ -209,7 +281,6 @@ class LeadFlow
         if (str_contains($t, 'foto')) return 'sesion_fotos';
         return 'otro';
     }
-
 
     private function saveDateAskPeople(WaConversation $c, string $text): void
     {

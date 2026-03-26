@@ -15,10 +15,9 @@ class AiResponder
             return null;
         }
 
-        
         $messages = array_merge(
             [
-                ['role' => 'system', 'content' => 'Eres asistente de un salón de eventos. Responde cordialmente y no repitas preguntas si ya tienes los datos.'],
+                ['role' => 'system', 'content' => 'Eres asistente de un salón de eventos. Responde de forma amable y breve. No inventes información: si alguna pregunta no está en la información proporcionada, indícale al usuario que complete su perfil para que un asesor pueda ayudarle. No agendes visitas ni menciones fechas disponibles; eso lo gestiona un asesor. Después de contestar, guía al usuario a seguir contestando las preguntas de su evento (nombre, tipo de evento, fecha, número de personas, presupuesto, paquete, fecha alternativa, tipo de cliente).'],
             ],
             $history,
             [
