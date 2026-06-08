@@ -16,18 +16,17 @@ use Illuminate\Support\Facades\Log;
  * - Las respuestas informativas salen solo de FaqMatcher.
  * - Cuando no hay dato exacto, el bot deriva a asesor y empuja a completar el formulario.
  * - La IA puede seguir existiendo inyectada, pero aquí ya no se usa para contestar contenido comercial.
+ * - Los leads calificados se notifican por Telegram para evitar las limitaciones de WhatsApp.
  */
 class LeadFlow
 {
     public function __construct(
         private WhatsAppCloud $wa,
         private FaqMatcher $faq,
-        private AiResponder $ai
+        private AiResponder $ai,
+        private TelegramNotifier $telegram
     ) {}
 
-    /**
-     * Punto de entrada principal para cada mensaje recibido.
-     */
     public function handle(WaConversation $c, string $text): void
     {
         $this->logConversationEntry($c, 'user', $text);
@@ -146,10 +145,6 @@ class LeadFlow
         $this->replyUnknownAndContinue($c);
     }
 
-    /**
-     * Maneja respuestas cuando ya hubo handoff.
-     * Puede seguir respondiendo dudas rápidas cerradas, pero no inventa nada.
-     */
     private function handlePostHandoff(WaConversation $c, string $text): void
     {
         $faqAnswer = $this->faq->match($text);
@@ -229,50 +224,27 @@ class LeadFlow
             case 'ask_event_type':
                 $this->askEventType($c);
                 break;
-
             case 'ask_name':
                 $this->askName($c);
                 break;
-
             case 'ask_event_date':
                 $this->reply($c, "¿Cuál es la fecha del evento? (día/mes/año)");
                 break;
-
             case 'ask_people_count':
                 $this->reply($c, "¿Para cuántas personas sería aproximadamente tu evento?");
                 break;
-
             case 'ask_budget_range':
-                $this->reply(
-                    $c,
-                    "¿Con qué presupuesto aproximado cuentas?\n"
-                    . "- \$30k a \$50k\n"
-                    . "- \$50k a \$100k\n"
-                    . "- \$100k a \$150k\n"
-                    . "- \$150k a \$200k\n"
-                    . "- \$200k+"
-                );
+                $this->reply($c, "¿Con qué presupuesto aproximado cuentas?\n- \$30k a \$50k\n- \$50k a \$100k\n- \$100k a \$150k\n- \$150k a \$200k\n- \$200k+");
                 break;
-
             case 'ask_package_type':
-                $this->reply(
-                    $c,
-                    "¿Qué opción te interesa más?\n"
-                    . "1) Paquete Primavera\n"
-                    . "2) Full Inclusive\n"
-                    . "3) Los Adobes\n"
-                    . "4) Paquete a la medida"
-                );
+                $this->reply($c, "¿Qué opción te interesa más?\n1) Paquete Primavera\n2) Full Inclusive\n3) Los Adobes\n4) Paquete a la medida");
                 break;
-
             case 'ask_alt_date':
                 $this->reply($c, "¿Tienes alguna fecha alternativa en caso de que la principal no esté disponible? (Sí/No)");
                 break;
-
             case 'ask_customer_type':
                 $this->reply($c, "¿El evento sería para empresa o persona física?");
                 break;
-
             case 'ask_source':
                 $this->reply($c, "¿Cómo te enteraste de nosotros? (Facebook, Instagram, recomendación, Google, etc.)");
                 break;
@@ -315,10 +287,17 @@ class LeadFlow
         $summary = $this->buildLeadSummary($lead, $reason);
 
         $this->logSummary($summary);
+        $this->telegram->send($summary);
 
         $internalNumber = config('services.whatsapp.internal_notify_number');
         if ($internalNumber) {
-            $this->wa->sendText($internalNumber, $summary);
+            try {
+                $this->wa->sendText($internalNumber, $summary);
+            } catch (\Throwable $e) {
+                Log::warning('WhatsApp internal notification failed.', [
+                    'message' => $e->getMessage(),
+                ]);
+            }
         }
     }
 
@@ -335,13 +314,13 @@ class LeadFlow
             . "Paquete: " . ($lead->package_type ?? 'N/D') . "\n"
             . "Tipo cliente: " . ($lead->customer_type ?? 'N/D') . "\n"
             . "Origen: " . ($lead->source ?? 'N/D') . "\n"
-            . "Score: " . ($lead->score ?? 0);
+            . "Score: " . ($lead->score ?? 0) . "\n\n"
+            . "La información también queda guardada en base de datos y logs del sistema.";
     }
 
     private function normalizeEventType(string $text): string
     {
         $t = mb_strtolower($text);
-
         if (str_contains($t, 'xv')) return 'xv';
         if (str_contains($t, 'boda')) return 'boda';
         if (str_contains($t, 'post')) return 'postboda';
@@ -349,7 +328,6 @@ class LeadFlow
         if (str_contains($t, 'shower')) return 'shower';
         if (str_contains($t, 'empres')) return 'empresarial';
         if (str_contains($t, 'foto')) return 'sesion_fotos';
-
         return 'otro';
     }
 
@@ -380,16 +358,7 @@ class LeadFlow
 
         $lead->update(['people_count' => $people]);
         $c->update(['state' => 'ask_budget_range']);
-
-        $this->reply(
-            $c,
-            "Perfecto. ¿Con qué presupuesto aproximado cuentas?\n"
-            . "- \$30k a \$50k\n"
-            . "- \$50k a \$100k\n"
-            . "- \$100k a \$150k\n"
-            . "- \$150k a \$200k\n"
-            . "- \$200k+"
-        );
+        $this->reply($c, "Perfecto. ¿Con qué presupuesto aproximado cuentas?\n- \$30k a \$50k\n- \$50k a \$100k\n- \$100k a \$150k\n- \$150k a \$200k\n- \$200k+");
     }
 
     private function saveBudgetAskPackage(WaConversation $c, string $text): void
@@ -398,29 +367,13 @@ class LeadFlow
         $budget = $this->normalizeBudgetRange($text);
 
         if (!$budget) {
-            $this->reply(
-                $c,
-                "¿Cuál de estas opciones se acerca más a tu presupuesto?\n"
-                . "- \$30k a \$50k\n"
-                . "- \$50k a \$100k\n"
-                . "- \$100k a \$150k\n"
-                . "- \$150k a \$200k\n"
-                . "- \$200k+"
-            );
+            $this->reply($c, "¿Cuál de estas opciones se acerca más a tu presupuesto?\n- \$30k a \$50k\n- \$50k a \$100k\n- \$100k a \$150k\n- \$150k a \$200k\n- \$200k+");
             return;
         }
 
         $lead->update(['budget_range' => $budget]);
         $c->update(['state' => 'ask_package_type']);
-
-        $this->reply(
-            $c,
-            "Gracias. ¿Qué opción te interesa más?\n"
-            . "1) Paquete Primavera\n"
-            . "2) Full Inclusive\n"
-            . "3) Los Adobes\n"
-            . "4) Paquete a la medida"
-        );
+        $this->reply($c, "Gracias. ¿Qué opción te interesa más?\n1) Paquete Primavera\n2) Full Inclusive\n3) Los Adobes\n4) Paquete a la medida");
     }
 
     private function savePackageAskAltDate(WaConversation $c, string $text): void
@@ -429,14 +382,7 @@ class LeadFlow
         $package = $this->normalizePackageType($text);
 
         if (!$package) {
-            $this->reply(
-                $c,
-                "Para asegurarme, elige una opción:\n"
-                . "1) Paquete Primavera\n"
-                . "2) Full Inclusive\n"
-                . "3) Los Adobes\n"
-                . "4) Paquete a la medida"
-            );
+            $this->reply($c, "Para asegurarme, elige una opción:\n1) Paquete Primavera\n2) Full Inclusive\n3) Los Adobes\n4) Paquete a la medida");
             return;
         }
 
@@ -507,13 +453,9 @@ class LeadFlow
         $this->handoff($c, "Lead calificado automáticamente. Score: {$lead->score}");
     }
 
-    /**
-     * Cuando no hay respuesta exacta en la base cerrada,
-     * no inventa y empuja el flujo comercial.
-     */
     private function replyUnknownAndContinue(WaConversation $c): void
     {
-        $lead = $this->ensureLead($c);
+        $this->ensureLead($c);
 
         $message = "No tengo esa información exacta y prefiero no darte un dato incorrecto.\n\n"
             . "Si te parece, te ayudo a completar tus datos para que un asesor te contacte con la información correcta.";
@@ -536,10 +478,7 @@ class LeadFlow
             $d = (int)$m[1];
             $mo = (int)$m[2];
             $y = (int)$m[3];
-
-            if ($y < 100) {
-                $y += 2000;
-            }
+            if ($y < 100) $y += 2000;
 
             try {
                 $dt = Carbon::createFromDate($y, $mo, $d);
@@ -550,29 +489,16 @@ class LeadFlow
         }
 
         $months = [
-            'enero' => 1,
-            'febrero' => 2,
-            'marzo' => 3,
-            'abril' => 4,
-            'mayo' => 5,
-            'junio' => 6,
-            'julio' => 7,
-            'agosto' => 8,
-            'septiembre' => 9,
-            'setiembre' => 9,
-            'octubre' => 10,
-            'noviembre' => 11,
-            'diciembre' => 12,
+            'enero' => 1, 'febrero' => 2, 'marzo' => 3, 'abril' => 4,
+            'mayo' => 5, 'junio' => 6, 'julio' => 7, 'agosto' => 8,
+            'septiembre' => 9, 'setiembre' => 9, 'octubre' => 10,
+            'noviembre' => 11, 'diciembre' => 12,
         ];
 
         $lower = mb_strtolower($t);
-
         foreach ($months as $name => $num) {
             if (str_contains($lower, $name)) {
-                if (
-                    preg_match('/\b(\d{1,2})\b/', $lower, $dm)
-                    && preg_match('/\b(20\d{2})\b/', $lower, $ym)
-                ) {
+                if (preg_match('/\b(\d{1,2})\b/', $lower, $dm) && preg_match('/\b(20\d{2})\b/', $lower, $ym)) {
                     try {
                         return Carbon::createFromDate((int)$ym[1], $num, (int)$dm[1]);
                     } catch (\Throwable $e) {
@@ -589,9 +515,7 @@ class LeadFlow
     {
         if (preg_match('/\b(\d{1,4})\b/', $text, $m)) {
             $n = (int)$m[1];
-            if ($n >= 1 && $n <= 2000) {
-                return $n;
-            }
+            if ($n >= 1 && $n <= 2000) return $n;
         }
 
         return null;
@@ -609,25 +533,15 @@ class LeadFlow
             $suf = $matches[2][$idx] ?? '';
             $val = (float)$num;
             $mult = 1;
-
-            if ($suf === 'k' || $suf === 'mil') {
-                $mult = 1000;
-            } elseif ($suf === 'm') {
-                $mult = 1000000;
-            }
-
+            if ($suf === 'k' || $suf === 'mil') $mult = 1000;
+            elseif ($suf === 'm') $mult = 1000000;
             $values[] = (int) round($val * $mult);
         }
 
-        if (empty($values)) {
-            return null;
-        }
+        if (empty($values)) return null;
 
         $avg = (int) round(array_sum($values) / count($values));
-
-        if ($avg < 1000) {
-            $avg *= 1000;
-        }
+        if ($avg < 1000) $avg *= 1000;
 
         if ($avg >= 30000 && $avg < 50000) return '30-50';
         if ($avg >= 50000 && $avg < 100000) return '50-100';
@@ -642,36 +556,10 @@ class LeadFlow
     {
         $t = mb_strtolower($text);
 
-        if (
-            preg_match('/\b1\b/', $t)
-            || str_contains($t, 'primavera')
-        ) {
-            return 'primavera';
-        }
-
-        if (
-            preg_match('/\b2\b/', $t)
-            || str_contains($t, 'full inclusive')
-            || (str_contains($t, 'full') && str_contains($t, 'inclusive'))
-        ) {
-            return 'full_inclusive';
-        }
-
-        if (
-            preg_match('/\b3\b/', $t)
-            || str_contains($t, 'adobes')
-        ) {
-            return 'los_adobes';
-        }
-
-        if (
-            preg_match('/\b4\b/', $t)
-            || str_contains($t, 'a la medida')
-            || str_contains($t, 'personalizado')
-            || str_contains($t, 'personalizada')
-        ) {
-            return 'a_la_medida';
-        }
+        if (preg_match('/\b1\b/', $t) || str_contains($t, 'primavera')) return 'primavera';
+        if (preg_match('/\b2\b/', $t) || str_contains($t, 'full inclusive') || (str_contains($t, 'full') && str_contains($t, 'inclusive'))) return 'full_inclusive';
+        if (preg_match('/\b3\b/', $t) || str_contains($t, 'adobes')) return 'los_adobes';
+        if (preg_match('/\b4\b/', $t) || str_contains($t, 'a la medida') || str_contains($t, 'personalizado') || str_contains($t, 'personalizada')) return 'a_la_medida';
 
         return null;
     }
@@ -679,17 +567,11 @@ class LeadFlow
     private function parseYesNo(string $text): ?bool
     {
         $t = mb_strtolower(trim($text));
-
         $yes = ['si', 'sí', 'simon', 'claro', 'ok', 'va', 'de acuerdo', 'afirmativo', 'claro que sí'];
-        $no  = ['no', 'nel', 'nop', 'para nada', 'negativo', 'nope'];
+        $no = ['no', 'nel', 'nop', 'para nada', 'negativo', 'nope'];
 
-        foreach ($yes as $w) {
-            if ($t === $w || str_contains($t, $w)) return true;
-        }
-
-        foreach ($no as $w) {
-            if ($t === $w || str_contains($t, $w)) return false;
-        }
+        foreach ($yes as $w) if ($t === $w || str_contains($t, $w)) return true;
+        foreach ($no as $w) if ($t === $w || str_contains($t, $w)) return false;
 
         return null;
     }
@@ -697,33 +579,22 @@ class LeadFlow
     private function normalizeCustomerType(string $text): ?string
     {
         $t = mb_strtolower($text);
-
-        if (preg_match('/\b1\b/', $t) || str_contains($t, 'empresa') || str_contains($t, 'empresarial')) {
-            return 'empresa';
-        }
-
-        if (preg_match('/\b2\b/', $t) || str_contains($t, 'persona') || str_contains($t, 'física') || str_contains($t, 'fisica')) {
-            return 'persona_fisica';
-        }
-
+        if (preg_match('/\b1\b/', $t) || str_contains($t, 'empresa') || str_contains($t, 'empresarial')) return 'empresa';
+        if (preg_match('/\b2\b/', $t) || str_contains($t, 'persona') || str_contains($t, 'física') || str_contains($t, 'fisica')) return 'persona_fisica';
         return null;
     }
 
     private function scoreLead(WaLead $lead): int
     {
         $score = 0;
-
         if ($lead->event_date) $score += 15;
         if ($lead->people_count) $score += 15;
         if ($lead->budget_range) $score += 25;
         if ($lead->package_type) $score += 10;
-
         if ($lead->people_count >= 100) $score += 10;
         if ($lead->people_count >= 200) $score += 10;
-
         if (in_array($lead->budget_range, ['150-200', '200+'], true)) $score += 10;
         if (in_array($lead->event_type, ['boda', 'xv', 'empresarial'], true)) $score += 10;
-
         return min(100, $score);
     }
 
@@ -740,8 +611,7 @@ class LeadFlow
         $line = json_encode($record, JSON_UNESCAPED_UNICODE);
 
         try {
-            $path = storage_path('logs/conversation.log');
-            file_put_contents($path, $line . PHP_EOL, FILE_APPEND);
+            file_put_contents(storage_path('logs/conversation.log'), $line . PHP_EOL, FILE_APPEND);
         } catch (\Throwable $e) {
             Log::info('Conversación: ' . $line);
         }
@@ -750,8 +620,7 @@ class LeadFlow
     private function logSummary(string $summary): void
     {
         try {
-            $path = storage_path('logs/lead_summary.log');
-            file_put_contents($path, $summary . PHP_EOL . str_repeat('-', 40) . PHP_EOL, FILE_APPEND);
+            file_put_contents(storage_path('logs/lead_summary.log'), $summary . PHP_EOL . str_repeat('-', 40) . PHP_EOL, FILE_APPEND);
         } catch (\Throwable $e) {
             Log::info('Resumen lead: ' . $summary);
         }
