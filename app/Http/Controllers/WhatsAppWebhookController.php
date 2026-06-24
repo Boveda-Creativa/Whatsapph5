@@ -40,12 +40,24 @@ class WhatsAppWebhookController extends Controller
         $from = data_get($message, 'from');
         $text = trim((string) data_get($message, 'text.body', ''));
         $waMessageId = data_get($message, 'id');
+        $messageTimestamp = data_get($message, 'timestamp');
 
         Log::info('Parsed message', [
             'from' => $from,
             'text' => $text,
             'wa_message_id' => $waMessageId,
+            'timestamp' => $messageTimestamp,
         ]);
+
+        if ($this->isStaleWebhookMessage($messageTimestamp)) {
+            Log::info('Stale WhatsApp webhook message ignored', [
+                'from' => $from,
+                'wa_message_id' => $waMessageId,
+                'timestamp' => $messageTimestamp,
+            ]);
+
+            return response('OK', 200);
+        }
 
         if ($waMessageId && WaMessage::where('wa_message_id', $waMessageId)->exists()) {
             Log::info('Duplicate WhatsApp message ignored', [
@@ -56,42 +68,50 @@ class WhatsAppWebhookController extends Controller
             return response('OK', 200);
         }
 
-        $conversation = WaConversation::firstOrCreate(
-            ['phone' => $from],
-            ['state' => 'new', 'mode' => 'bot', 'data' => []]
-        );
+        try {
+            $conversation = WaConversation::firstOrCreate(
+                ['phone' => $from],
+                ['state' => 'new', 'mode' => 'bot', 'data' => []]
+            );
 
-        if ($this->shouldRestartStaleHandoff($conversation)) {
-            Log::info('Restarting stale handoff conversation', [
-                'conversation_id' => $conversation->id,
-                'phone' => $conversation->phone,
-                'previous_state' => $conversation->state,
-                'previous_mode' => $conversation->mode,
-                'last_inbound_at' => optional($conversation->last_inbound_at)->toDateTimeString(),
-            ]);
+            if ($this->shouldRestartStaleHandoff($conversation)) {
+                Log::info('Restarting stale handoff conversation', [
+                    'conversation_id' => $conversation->id,
+                    'phone' => $conversation->phone,
+                    'previous_state' => $conversation->state,
+                    'previous_mode' => $conversation->mode,
+                    'last_inbound_at' => optional($conversation->last_inbound_at)->toDateTimeString(),
+                ]);
+
+                $conversation->update([
+                    'state' => 'new',
+                    'mode' => 'bot',
+                    'lead_id' => null,
+                    'data' => [],
+                ]);
+            }
 
             $conversation->update([
-                'state' => 'new',
-                'mode' => 'bot',
-                'lead_id' => null,
-                'data' => [],
+                'last_inbound_at' => now(),
+                'window_open_until' => now()->addHours(24),
+            ]);
+
+            WaMessage::create([
+                'conversation_id' => $conversation->id,
+                'direction' => 'in',
+                'body' => $text,
+                'raw' => $request->all(),
+                'wa_message_id' => $waMessageId,
+            ]);
+
+            ProcessIncomingWaMessage::dispatchSync($conversation->id, $text);
+        } catch (\Throwable $e) {
+            Log::error('WhatsApp webhook processing failed', [
+                'from' => $from,
+                'wa_message_id' => $waMessageId,
+                'message' => $e->getMessage(),
             ]);
         }
-
-        $conversation->update([
-            'last_inbound_at' => now(),
-            'window_open_until' => now()->addHours(24),
-        ]);
-
-        WaMessage::create([
-            'conversation_id' => $conversation->id,
-            'direction' => 'in',
-            'body' => $text,
-            'raw' => $request->all(),
-            'wa_message_id' => $waMessageId,
-        ]);
-
-        ProcessIncomingWaMessage::dispatchSync($conversation->id, $text);
 
         return response('OK', 200);
     }
@@ -107,5 +127,14 @@ class WhatsAppWebhookController extends Controller
         }
 
         return $conversation->last_inbound_at->lt(now()->subDays(2));
+    }
+
+    private function isStaleWebhookMessage(mixed $timestamp): bool
+    {
+        if (!$timestamp || !is_numeric($timestamp)) {
+            return false;
+        }
+
+        return (int) $timestamp < now()->subMinutes(10)->timestamp;
     }
 }
